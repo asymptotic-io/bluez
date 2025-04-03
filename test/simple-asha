@@ -4,6 +4,7 @@
 import os
 import signal
 import sys
+import time
 
 import dbus
 import dbus.service
@@ -20,6 +21,7 @@ import bluezutils
 mainloop = None
 pipeline = None
 seqnum: int = 0
+start = None
 
 
 def signal_handler(_sig, _frame):
@@ -31,10 +33,22 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def usage():
-    print(f"Usage: simple-asha <remote addr> <audio file name> (optional volume 0-127)")
+    print("Usage: simple-asha <remote addr> <audio file name> (optional volume 0-127)")
 
 
-def start_playback(fd: int, omtu: int):
+def try_write(fd: int, outdata: bytearray, tries: int):
+    if tries < 1:
+        raise Exception("No more tries")
+
+    try:
+        return os.write(fd, outdata)
+    except:
+        # Sleep 1ms and retry
+        time.sleep(0.002)
+        try_write(fd, outdata, tries - 1)
+
+
+def start_playback(fd1: int, fd2: int, omtu: int):
     global mainloop, pipeline
     pktsize = 161
 
@@ -47,18 +61,25 @@ def start_playback(fd: int, omtu: int):
 
     pipeline = Gst.parse_launch(
         f"""
-          filesrc location="{sys.argv[2]}" ! decodebin !
+          filesrc location="{sys.argv[3]}" ! decodebin !
           audioconvert ! audioresample !
           audiobuffersplit output-buffer-duration="20/1000" ! avenc_g722 !
-          appsink name=sink emit-signals=true
+          tee name=t
+          t. ! queue ! appsink name=sink1 emit-signals=true
+          t. ! queue ! appsink name=sink2 emit-signals=true
     """
     )
 
-    def on_new_sample(sink):
-        global seqnum
+    def on_new_sample(sink, fd):
+        global start
+
+        if start is None:
+            start = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
         sample = sink.emit("pull-sample")
         buf = sample.get_buffer()
+
+        seqnum = int(buf.pts / (20 * Gst.MSECOND)) % 256
 
         with buf.map(Gst.MapFlags.READ) as info:
             pos = 0
@@ -74,18 +95,25 @@ def start_playback(fd: int, omtu: int):
                 pos += 1
 
             try:
-                n = os.write(fd, outdata)
+                t1 = (time.clock_gettime_ns(time.CLOCK_MONOTONIC) - start) / 1000000
+                n = try_write(fd, outdata, 10)
+                t2 = (time.clock_gettime_ns(time.CLOCK_MONOTONIC) - start) / 1000000
                 if n != pktsize:
-                    print("Wrote less than expected: ", n)
-            except:
-                return Gst.FlowReturn.ERROR
+                    print("Wrote less than expected for device: ", n)
+                else:
+                    print(f"{fd}: wrote {seqnum} {t1} {t2}")
+            except Exception as e:
+                print("Device 2 failed write", e)
 
         seqnum += 1
 
         return Gst.FlowReturn.OK
 
-    sink = pipeline.get_by_name("sink")
-    sink.connect("new-sample", on_new_sample)
+    sink = pipeline.get_by_name("sink1")
+    sink.connect("new-sample", on_new_sample, fd1)
+
+    sink = pipeline.get_by_name("sink2")
+    sink.connect("new-sample", on_new_sample, fd2)
 
     def bus_message(_bus, message, _data) -> bool:
         typ = message.type
@@ -112,55 +140,93 @@ if __name__ == "__main__":
     mainloop = GLib.MainLoop()
     bus = dbus.SystemBus()
 
-    if (len(sys.argv) == 3) or (len(sys.argv) == 4):
-        device = bluezutils.find_device(sys.argv[1])
-        if device is None:
-            print("Could not find device: ", sys.argv[1])
+    if (len(sys.argv) == 4) or (len(sys.argv) == 5):
+        device1 = bluezutils.find_device(sys.argv[1])
+        if device1 is None:
+            print("Could not find device1: ", sys.argv[1])
+            exit(255)
+        device2 = bluezutils.find_device(sys.argv[2])
+        if device2 is None:
+            print("Could not find device2: ", sys.argv[2])
             exit(255)
     else:
         usage()
         sys.exit(255)
 
-    asha_object_path = device.object_path + "/asha"
+    asha1_object_path = device1.object_path + "/asha"
 
-    print("Looking up ASHA object", asha_object_path)
-    asha = bus.get_object("org.bluez", asha_object_path)
+    print("Looking up ASHA object", asha1_object_path)
+    asha1 = bus.get_object("org.bluez", asha1_object_path)
 
-    print("Looking up endpoint properties for", asha.object_path)
-    props = asha.GetAll(
+    print("Looking up endpoint properties for", asha1.object_path)
+    props = asha1.GetAll(
         "org.bluez.MediaEndpoint1",
         dbus_interface="org.freedesktop.DBus.Properties",
     )
-    path = props["Transport"]
+    path1 = props["Transport"]
 
-    print("Trying to acquire", path)
-    transport = dbus.Interface(
-        bus.get_object("org.bluez", path),
+    print("Trying to acquire", path1)
+    transport1 = dbus.Interface(
+        bus.get_object("org.bluez", path1),
+        "org.bluez.MediaTransport1",
+    )
+
+    asha2_object_path = device2.object_path + "/asha"
+
+    print("Looking up ASHA object", asha2_object_path)
+    asha2 = bus.get_object("org.bluez", asha2_object_path)
+
+    print("Looking up endpoint properties for", asha2.object_path)
+    props = asha2.GetAll(
+        "org.bluez.MediaEndpoint1",
+        dbus_interface="org.freedesktop.DBus.Properties",
+    )
+    path2 = props["Transport"]
+
+    print("Trying to acquire", path2)
+    transport2 = dbus.Interface(
+        bus.get_object("org.bluez", path2),
         "org.bluez.MediaTransport1",
     )
 
     # Keep default volume at 25%
-    volume = 32
-    if len(sys.argv) == 4:
-        volume = int(sys.argv[3])
-        if volume < 0 or volume > 127:
-            print("Volume must be between 0 (mute) and 127 (max)")
+    volume = 127
+    # if len(sys.argv) == 5:
+    #     volume = int(sys.argv[4])
+    #     if volume < 0 or volume > 127:
+    #         print("Volume must be between 0 (mute) and 127 (max)")
 
     print("Setting initial volume to", volume)
-    transport.Set(
+    transport1.Set(
+        "org.bluez.MediaTransport1",
+        "Volume",
+        dbus.UInt16(volume, variant_level=1),
+        dbus_interface="org.freedesktop.DBus.Properties",
+    )
+    transport2.Set(
         "org.bluez.MediaTransport1",
         "Volume",
         dbus.UInt16(volume, variant_level=1),
         dbus_interface="org.freedesktop.DBus.Properties",
     )
 
-    print("Acquiring transport")
-    (fd, imtu, omtu) = transport.Acquire()
+    print("Acquiring transport for Device 1")
+    (fd1, imtu, omtu) = transport1.Acquire()
+
+    print("Acquiring transport for Device 2")
+    (fd2, imtu, omtu) = transport2.Acquire()
+
+    #time.sleep(3)
 
     print("Starting playback, hit Ctrl-C to stop")
-    start_playback(fd.take(), omtu)
+    start_playback(fd1.take(), fd2.take(), omtu)
+
+    Gst.debug_bin_to_dot_file_with_ts(
+        pipeline, Gst.DebugGraphDetails.VERBOSE, "gst-asha"
+    )
 
     mainloop.run()
 
     pipeline.set_state(Gst.State.NULL)
-    transport.Release()
+    transport1.Release()
+    transport2.Release()
